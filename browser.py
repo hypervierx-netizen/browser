@@ -58,7 +58,7 @@ QTabBar::tab {
     background: rgba(30, 30, 46, 200);
     color: #a6adc8;
     border-radius: 11px;
-    padding: 5px 14px;
+    padding: 5px 6px 5px 14px;
     margin: 4px 3px 6px 3px;
     max-width: 180px;
 }
@@ -70,14 +70,16 @@ QTabBar::tab:selected {
 QTabBar::tab:hover { color: #89b4fa; }
 
 QToolButton#tabclose {
-    background: transparent;
-    color: #6c7086;
-    border-radius: 8px;
-    padding: 0px 4px;
-    font-size: 11px;
+    background: rgba(108, 112, 134, 60);
+    color: #cdd6f4;
+    min-width: 18px; max-width: 18px;
+    min-height: 18px; max-height: 18px;
+    border-radius: 9px;
+    padding: 0px;
+    font-size: 12px;
     font-weight: normal;
 }
-QToolButton#tabclose:hover { background: rgba(243, 139, 168, 40); color: #f38ba8; }
+QToolButton#tabclose:hover { background: rgba(243, 139, 168, 70); color: #f38ba8; }
 """
 
 
@@ -185,7 +187,12 @@ class Browser(QMainWindow):
 
         close = QToolButton(text="✕", objectName="tabclose")
         close.clicked.connect(lambda _, v=view: self.close_tab(self.tabs.indexOf(v)))
-        self.tabs.tabBar().setTabButton(i, QTabBar.ButtonPosition.RightSide, close)
+        # wrapper centers the circle between the tab text and the tab's right wall
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 6, 0)
+        hl.addWidget(close)
+        self.tabs.tabBar().setTabButton(i, QTabBar.ButtonPosition.RightSide, holder)
 
         if switch:
             self.tabs.setCurrentIndex(i)
