@@ -24,13 +24,19 @@ cat > ~/.local/share/applications/browser.desktop <<EOF
 Type=Application
 Name=Browser
 Comment=Minimal island-styled browser
-Exec=python3 $DIR/browser.py
+Exec=python3 $DIR/browser.py %u
 Terminal=false
 Categories=Network;WebBrowser;
 Icon=browser
 StartupWMClass=browser
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
 EOF
 gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null || true
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
+
+read -r -p "Set Browser as the default web browser? [y/N] " answer
+if [ "$answer" = "y" ] || [ "$answer" = "Y" ]; then
+    xdg-settings set default-web-browser browser.desktop && echo "    default browser set"
+fi
 
 echo "==> Done. Launch 'Browser' from your app menu or run: python3 $DIR/browser.py"

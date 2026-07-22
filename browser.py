@@ -11,11 +11,16 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
     + " --blink-settings=preferredColorScheme=0")
 
-from PyQt6.QtCore import Qt, QStringListModel, QTimer, QUrl, QUrlQuery
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut, QGuiApplication
+from PyQt6.QtCore import (
+    Qt, QElapsedTimer, QStringListModel, QTimer, QUrl, QUrlQuery,
+)
+from PyQt6.QtGui import (
+    QDesktopServices, QIcon, QKeySequence, QShortcut, QGuiApplication,
+)
 from PyQt6.QtWidgets import (
-    QApplication, QCompleter, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QTabWidget, QTabBar, QToolButton,
+    QApplication, QCompleter, QLabel, QMainWindow, QProgressBar, QWidget,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QTabWidget, QTabBar,
+    QToolButton,
 )
 from PyQt6.QtWebEngineCore import (
     QWebEngineProfile, QWebEnginePage, QWebEngineSettings,
@@ -84,6 +89,18 @@ QTabBar::tab:selected {
 }
 QTabBar::tab:hover { color: #89b4fa; }
 
+#dlbar { background: #11111b; border-top: 1px solid rgba(137, 180, 250, 40); }
+#dlitem { background: rgba(30, 30, 46, 230); border-radius: 12px; }
+QLabel#dlname { color: #cdd6f4; }
+QLabel#dlinfo { color: #6c7086; font-size: 11px; }
+QProgressBar {
+    background: #313244;
+    border: none;
+    border-radius: 3px;
+    max-height: 6px;
+}
+QProgressBar::chunk { background: #89b4fa; border-radius: 3px; }
+
 QToolButton#tabclose {
     background: rgba(108, 112, 134, 60);
     color: #cdd6f4;
@@ -105,19 +122,126 @@ class WebView(QWebEngineView):
         self.setPage(QWebEnginePage(profile, self))
         self.page().fullScreenRequested.connect(self._fullscreen)
 
-    def createWindow(self, _type):
-        # tab for a link opened by a page (e.g. target=_blank);
-        # the engine loads the URL itself, so don't load the start page
-        return self.browser.new_tab(switch=True, blank=True)
+    def createWindow(self, wtype):
+        # tab for a link opened by a page (ctrl+click, middle-click,
+        # target=_blank); the engine loads the URL itself, so don't load
+        # the start page. Ctrl/middle-click = background tab, like Chrome.
+        background = (wtype ==
+                      QWebEnginePage.WebWindowType.WebBrowserBackgroundTab)
+        return self.browser.new_tab(switch=not background, blank=True)
 
     def _fullscreen(self, request):
         request.accept()
         self.browser.set_fullscreen(request.toggleOn())
 
 
+def fmt_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def fmt_time(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60} s"
+    return f"{seconds // 3600} h {seconds % 3600 // 60} min"
+
+
+class DownloadWidget(QWidget):
+    """One entry in the download bar: name, progress, speed, time left."""
+
+    def __init__(self, request, on_dismiss):
+        super().__init__(objectName="dlitem")
+        self.req = request
+        self.on_dismiss = on_dismiss
+        self.clock = QElapsedTimer()
+        self.clock.start()
+        self.last_bytes = 0
+        self.last_ms = 0
+        self.speed = 0.0
+
+        self.setFixedWidth(360)
+        name = request.downloadFileName()
+        self.name = QLabel(objectName="dlname")
+        self.name.setText(self.fontMetrics().elidedText(
+            name, Qt.TextElideMode.ElideMiddle, 230))
+        self.name.setToolTip(name)
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.info = QLabel("Starting…", objectName="dlinfo")
+
+        self.open_btn = QToolButton(text="Open")
+        self.open_btn.hide()
+        self.open_btn.clicked.connect(lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(self.req.downloadDirectory())))
+        self.close_btn = QToolButton(text="✕")
+        self.close_btn.clicked.connect(self._cancel_or_dismiss)
+
+        grid = QGridLayout(self)
+        grid.setContentsMargins(12, 8, 8, 8)
+        grid.setVerticalSpacing(4)
+        grid.addWidget(self.name, 0, 0)
+        grid.addWidget(self.open_btn, 0, 1)
+        grid.addWidget(self.close_btn, 0, 2)
+        grid.addWidget(self.bar, 1, 0, 1, 3)
+        grid.addWidget(self.info, 2, 0, 1, 3)
+
+        request.receivedBytesChanged.connect(self._progress)
+        request.totalBytesChanged.connect(self._progress)
+        request.stateChanged.connect(self._state_changed)
+
+    def _progress(self):
+        if self.req.state() != self.req.DownloadState.DownloadInProgress:
+            return
+        received, total = self.req.receivedBytes(), self.req.totalBytes()
+        ms = self.clock.elapsed()
+        if ms - self.last_ms >= 300:
+            instant = (received - self.last_bytes) / ((ms - self.last_ms) / 1000)
+            self.speed = instant if not self.speed else 0.7 * self.speed + 0.3 * instant
+            self.last_bytes, self.last_ms = received, ms
+        parts = []
+        if total > 0:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(round(received / total * 1000))
+            parts.append(f"{fmt_size(received)} / {fmt_size(total)}")
+        else:
+            self.bar.setRange(0, 0)  # size unknown: busy animation
+            parts.append(fmt_size(received))
+        if self.speed > 0:
+            parts.append(f"{fmt_size(self.speed)}/s")
+            if total > 0:
+                parts.append(f"{fmt_time((total - received) / self.speed)} left")
+        self.info.setText(" · ".join(parts))
+
+    def _state_changed(self, state):
+        St = self.req.DownloadState
+        if state == St.DownloadCompleted:
+            self.bar.setRange(0, 1000)
+            self.bar.setValue(1000)
+            self.info.setText(f"Done · {fmt_size(self.req.receivedBytes())}")
+            self.open_btn.show()
+        elif state == St.DownloadCancelled:
+            self.bar.setRange(0, 1000)
+            self.info.setText("Cancelled")
+        elif state == St.DownloadInterrupted:
+            self.bar.setRange(0, 1000)
+            self.info.setText("Failed: " + self.req.interruptReasonString())
+
+    def _cancel_or_dismiss(self):
+        if self.req.state() == self.req.DownloadState.DownloadInProgress:
+            self.req.cancel()
+        else:
+            self.on_dismiss(self)
+
+
 class Browser(QMainWindow):
-    def __init__(self):
+    def __init__(self, initial_url=None):
         super().__init__()
+        self._initial_url = initial_url
         self.setWindowTitle("browser")
         self.resize(1280, 820)
 
@@ -196,12 +320,21 @@ class Browser(QMainWindow):
         lay.setSpacing(0)
         lay.addLayout(bar)
 
+        # download bar (hidden until a download starts)
+        self.dlbar = QWidget(objectName="dlbar")
+        self.dllay = QHBoxLayout(self.dlbar)
+        self.dllay.setContentsMargins(10, 8, 10, 8)
+        self.dllay.setSpacing(8)
+        self.dllay.addStretch()
+        self.dlbar.hide()
+
         root = QWidget()
         rlay = QVBoxLayout(root)
         rlay.setContentsMargins(0, 0, 0, 0)
         rlay.setSpacing(0)
         rlay.addWidget(self.chrome)
         rlay.addWidget(self.tabs, 1)
+        rlay.addWidget(self.dlbar)
         self.setCentralWidget(root)
 
         for key, fn in {
@@ -217,7 +350,7 @@ class Browser(QMainWindow):
         }.items():
             QShortcut(QKeySequence(key), self).activated.connect(fn)
 
-        self.new_tab()
+        self.new_tab(url=initial_url)
 
     # ---- tabs ----
     def current(self):
@@ -354,19 +487,40 @@ class Browser(QMainWindow):
 
     def _download(self, request):
         request.setDownloadDirectory(str(DOWNLOAD_DIR))
+        # don't overwrite existing files: name.pdf -> name (1).pdf
+        name = request.downloadFileName()
+        stem, suffix = Path(name).stem, Path(name).suffix
+        n = 1
+        while (DOWNLOAD_DIR / name).exists():
+            name = f"{stem} ({n}){suffix}"
+            n += 1
+        request.setDownloadFileName(name)
         request.accept()
+        widget = DownloadWidget(request, self._dismiss_download)
+        self.dllay.insertWidget(self.dllay.count() - 1, widget)
+        self.dlbar.show()
+
+    def _dismiss_download(self, widget):
+        self.dllay.removeWidget(widget)
+        widget.deleteLater()
+        if self.dllay.count() <= 1:  # only the stretch left
+            self.dlbar.hide()
 
 
 SINGLE_INSTANCE_SOCKET = "browser-single-instance"
 
 
 def main():
+    # a URL argument means we were asked to open a link (e.g. as the
+    # system default browser)
+    url = sys.argv[1] if len(sys.argv) > 1 else None
+
     # single instance: two instances sharing one profile breaks Chromium's
-    # network/cache storage, so hand off to the running one instead
+    # network/cache storage, so hand the link to the running one instead
     probe = QLocalSocket()
     probe.connectToServer(SINGLE_INSTANCE_SOCKET)
     if probe.waitForConnected(300):
-        probe.write(b"raise")
+        probe.write((url or "raise").encode())
         probe.flush()
         probe.waitForBytesWritten(300)
         return
@@ -376,13 +530,24 @@ def main():
     app.setApplicationName("browser")
     app.setWindowIcon(QIcon(str(APP_DIR / "icon.svg")))
     app.setStyleSheet(STYLE)
-    win = Browser()
+    win = Browser(initial_url=url)
 
     QLocalServer.removeServer(SINGLE_INSTANCE_SOCKET)
     server = QLocalServer()
     server.listen(SINGLE_INSTANCE_SOCKET)
-    server.newConnection.connect(
-        lambda: (win.new_tab(), win.showNormal(), win.raise_(), win.activateWindow()))
+
+    def handoff():
+        conn = server.nextPendingConnection()
+
+        def read():
+            message = bytes(conn.readAll()).decode().strip()
+            win.new_tab(url=None if message in ("", "raise") else message)
+            win.showNormal()
+            win.raise_()
+            win.activateWindow()
+        conn.readyRead.connect(read)
+
+    server.newConnection.connect(handoff)
 
     win.show()
     sys.exit(app.exec())
