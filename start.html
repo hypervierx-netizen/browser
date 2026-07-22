@@ -221,6 +221,56 @@
   .thumb:hover { border-color: rgba(137, 180, 250, 0.5); }
   .thumb.sel { border-color: #89b4fa; }
 
+  /* privacy section */
+  .privacy { display: flex; flex-direction: column; gap: 10px; }
+  .switchrow {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: #cdd6f4;
+    cursor: pointer;
+  }
+  .switchrow span:first-child { flex: 1; }
+  .switchrow input { display: none; }
+  .slider {
+    width: 34px;
+    height: 19px;
+    border-radius: 10px;
+    background: #45475a;
+    position: relative;
+    transition: background .15s;
+    flex-shrink: 0;
+  }
+  .slider::after {
+    content: "";
+    position: absolute;
+    top: 2.5px;
+    left: 3px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #cdd6f4;
+    transition: transform .15s;
+  }
+  .switchrow input:checked + .slider { background: #89b4fa; }
+  .switchrow input:checked + .slider::after { transform: translateX(14px); }
+  .privbtns { display: flex; gap: 8px; }
+  .privbtns button {
+    flex: 1;
+    background: #11111b;
+    border: 1px solid rgba(108, 112, 134, 0.4);
+    border-radius: 9px;
+    color: #a6adc8;
+    font: inherit;
+    font-size: 12px;
+    padding: 7px 0;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .privbtns button:hover { color: #89b4fa; border-color: #89b4fa; }
+  #clearhist:hover { color: #f38ba8; border-color: #f38ba8; }
+
 </style>
 </head>
 <body>
@@ -248,10 +298,23 @@
   </datalist>
 
   <button id="gear" title="Customize">⚙</button>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
   <div id="settings">
     <h3>Background</h3>
     <div class="thumbs" id="thumbs"></div>
     <input type="file" id="bgfile" accept="image/*" hidden>
+    <h3>&#128737;&#65039; Privacy</h3>
+    <div class="privacy">
+      <label class="switchrow">
+        <span>Save history</span>
+        <input type="checkbox" id="histtoggle" checked>
+        <span class="slider"></span>
+      </label>
+      <div class="privbtns">
+        <button type="button" id="viewhist">View history</button>
+        <button type="button" id="clearhist">Clear history</button>
+      </div>
+    </div>
   </div>
 <script>
   const DEFAULTS = [
@@ -403,6 +466,28 @@
   };
 
   applyBg();
+
+  // ---- privacy / history (talks to the browser via QWebChannel) ----
+  let bridge = null;
+  if (typeof qt !== "undefined") {
+    new QWebChannel(qt.webChannelTransport, (ch) => {
+      bridge = ch.objects.bridge;
+      bridge.historyEnabled((v) => {
+        document.getElementById("histtoggle").checked = v;
+      });
+    });
+  }
+  document.getElementById("histtoggle").onchange = (e) => {
+    if (bridge) bridge.setHistoryEnabled(e.target.checked);
+  };
+  document.getElementById("viewhist").onclick = () => {
+    location.href = "history.html";
+  };
+  document.getElementById("clearhist").onclick = (e) => {
+    if (bridge) bridge.clearHistory();
+    e.target.textContent = "Cleared ✓";
+    setTimeout(() => { e.target.textContent = "Clear history"; }, 1500);
+  };
 
   function tick() {
     const now = new Date();

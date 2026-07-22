@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # sites see prefers-color-scheme: dark and serve their native dark theme
@@ -12,8 +13,10 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     + " --blink-settings=preferredColorScheme=0")
 
 from PyQt6.QtCore import (
-    Qt, QElapsedTimer, QStringListModel, QTimer, QUrl, QUrlQuery,
+    Qt, QElapsedTimer, QObject, QStringListModel, QTimer, QUrl, QUrlQuery,
+    pyqtSlot,
 )
+from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtGui import (
     QDesktopServices, QIcon, QKeySequence, QShortcut, QGuiApplication,
 )
@@ -36,6 +39,10 @@ SEARCH_URL = "https://www.google.com/search?q={}"
 SUGGEST_URL = "https://suggestqueries.google.com/complete/search"
 DOWNLOAD_DIR = Path.home() / "Downloads"
 HOSTS_FILE = Path.home() / ".local/share/browser/hosts.json"
+HISTORY_FILE = Path.home() / ".local/share/browser/history.json"
+CONFIG_FILE = Path.home() / ".local/share/browser/config.json"
+HISTORY_PAGE = QUrl.fromLocalFile(str(APP_DIR / "history.html"))
+HISTORY_MAX = 3000
 
 # domain guesses for the address bar ("wiki" -> wikipedia.org);
 # visited sites are remembered and suggested too
@@ -115,11 +122,40 @@ QToolButton#tabclose:hover { background: rgba(243, 139, 168, 70); color: #f38ba8
 """
 
 
+class Bridge(QObject):
+    """Exposed to the start/history pages via QWebChannel."""
+
+    def __init__(self, browser):
+        super().__init__()
+        self.browser = browser
+
+    @pyqtSlot(result=bool)
+    def historyEnabled(self):
+        return self.browser.config.get("history", True)
+
+    @pyqtSlot(bool)
+    def setHistoryEnabled(self, enabled):
+        self.browser.config["history"] = enabled
+        self.browser.save_config()
+
+    @pyqtSlot(result=str)
+    def getHistory(self):
+        return json.dumps(self.browser.history)
+
+    @pyqtSlot()
+    def clearHistory(self):
+        self.browser.history = []
+        self.browser.save_history()
+
+
 class WebView(QWebEngineView):
     def __init__(self, browser, profile):
         super().__init__()
         self.browser = browser
         self.setPage(QWebEnginePage(profile, self))
+        channel = QWebChannel(self.page())
+        channel.registerObject("bridge", browser.bridge)
+        self.page().setWebChannel(channel)
         self.page().fullScreenRequested.connect(self._fullscreen)
 
     def createWindow(self, wtype):
@@ -245,6 +281,16 @@ class Browser(QMainWindow):
         self.setWindowTitle("browser")
         self.resize(1280, 820)
 
+        try:
+            self.config = json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            self.config = {}
+        try:
+            self.history = json.loads(HISTORY_FILE.read_text())
+        except Exception:
+            self.history = []
+        self.bridge = Bridge(self)
+
         self.profile = QWebEngineProfile("browser", self)
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
@@ -347,6 +393,7 @@ class Browser(QMainWindow):
             "Ctrl+Tab": lambda: self._cycle(1),
             "Ctrl+Shift+Tab": lambda: self._cycle(-1),
             "F11": lambda: self.set_fullscreen(not self.isFullScreen()),
+            "Ctrl+H": lambda: self.new_tab(url=HISTORY_PAGE.toString()),
         }.items():
             QShortcut(QKeySequence(key), self).activated.connect(fn)
 
@@ -472,6 +519,36 @@ class Browser(QMainWindow):
         if i >= 0:
             self.tabs.setTabText(i, title or "New tab")
             self.tabs.setTabToolTip(i, title)
+        self._record_history(view.url(), title)
+
+    # ---- history ----
+    def _record_history(self, url, title):
+        if not self.config.get("history", True):
+            return
+        if url.scheme() not in ("http", "https") or not title:
+            return
+        entry = {"url": url.toString(), "title": title, "t": int(time.time())}
+        if self.history and self.history[-1]["url"] == entry["url"]:
+            self.history[-1] = entry  # same page: refresh title/time only
+        else:
+            self.history.append(entry)
+            if len(self.history) > HISTORY_MAX:
+                del self.history[:len(self.history) - HISTORY_MAX + 500]
+        self.save_history()
+
+    def save_history(self):
+        try:
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            HISTORY_FILE.write_text(json.dumps(self.history))
+        except OSError:
+            pass
+
+    def save_config(self):
+        try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps(self.config))
+        except OSError:
+            pass
 
     def _tab_changed(self, _index):
         view = self.current()
