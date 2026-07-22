@@ -72,9 +72,10 @@ QTabBar::tab {
     background: rgba(30, 30, 46, 200);
     color: #a6adc8;
     border-radius: 11px;
-    padding: 5px 6px 5px 14px;
+    padding: 7px 6px 7px 14px;
     margin: 4px 3px 6px 3px;
-    max-width: 180px;
+    min-width: 160px;
+    max-width: 240px;
 }
 QTabBar::tab:selected {
     background: #313244;
