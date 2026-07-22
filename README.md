@@ -9,8 +9,11 @@ A minimal web browser for Linux, written in Python with PyQt6 and Qt WebEngine (
 - Address bar with combined URL and Google search input
 - Autocomplete suggestions from known domains, visited sites, and Google
 - Dark mode: sites are requested in dark theme, light-only sites are darkened automatically
+- Download bar with progress, transfer speed, estimated time remaining, and cancel
+- Browsing history (Ctrl+H) grouped by day with search; recording can be disabled in the privacy settings, and history can be cleared at any time
 - Configurable start page: clock, search, editable quick links, and optional background images (bundled photos or user-supplied)
 - Single-instance behavior: subsequent launches open a new tab in the running window
+- Can act as the system default browser; links from other applications open in the running window
 - Fullscreen media support; downloads are saved to `~/Downloads`
 
 ## Requirements
@@ -44,6 +47,7 @@ python3 browser.py
 | Ctrl+L | Focus address bar |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
 | Ctrl+R / F5 | Reload |
+| Ctrl+H | History |
 | F11 | Fullscreen |
 | Ctrl+Q | Quit |
 
@@ -54,8 +58,11 @@ There is no configuration file. The relevant sources are:
 | Path | Description |
 |------|-------------|
 | `browser.py` | Application code. UI colors are defined in the `STYLE` string. |
-| `start.html` | Start page. Quick links and background selection are managed in the page itself and stored in local storage. |
+| `start.html` | Start page. Quick links, background selection, and privacy settings are managed in the page itself. |
+| `history.html` | History page. |
 | `backgrounds/` | Bundled background images. |
+
+User data (history, settings, cookies) is stored under `~/.local/share/browser/`.
 
 The color scheme follows Catppuccin Mocha.
 
