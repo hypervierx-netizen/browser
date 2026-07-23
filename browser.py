@@ -736,6 +736,13 @@ class Browser(QMainWindow):
         self.dllay.insertWidget(self.dllay.count() - 1, widget)
         self.dlbar.show()
 
+    def closeEvent(self, event):
+        # closing the window from the compositor (e.g. Super+Q) must end
+        # the process too — a lingering ghost would hold the
+        # single-instance socket and swallow future launches
+        QApplication.instance().quit()
+        super().closeEvent(event)
+
     def _dismiss_download(self, widget):
         self.dllay.removeWidget(widget)
         widget.deleteLater()
