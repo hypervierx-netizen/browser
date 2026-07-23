@@ -41,7 +41,7 @@ automatically. Right: GitHub serves its native dark theme.*
 ## Install
 
 ```sh
-git clone https://github.com/hypervierx-netizen/browser.git
+git clone https://github.com/idkhowtonamemyselfasadev/browser.git
 cd browser
 ./install.sh
 ```
