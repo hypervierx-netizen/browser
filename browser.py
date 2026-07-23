@@ -188,7 +188,7 @@ class Bridge(QObject):
         elif "Already up to date" in out:
             msg = "You have the newest version \u2713"
         else:
-            msg = "Updated! Close the browser (Ctrl+Q) and reopen it."
+            msg = "Updated! Restart the browser to finish."
         self.updateFinished.emit(msg)
 
     @pyqtSlot(result=bool)
@@ -545,9 +545,15 @@ class Browser(QMainWindow):
         if not self._toast:
             return
         self._toast_label.setText(msg)
+        if msg.startswith("Updated"):
+            restart = QToolButton(text="Restart now")
+            restart.clicked.connect(self.restart)
+            self._toast.layout().insertWidget(1, restart)
+            self._toast_timer.stop()  # stays until acted on or dismissed
+        else:
+            self._toast_timer.setInterval(8000)
+            self._toast_timer.start()
         self._place_toast()
-        self._toast_timer.setInterval(8000)
-        self._toast_timer.start()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -736,6 +742,18 @@ class Browser(QMainWindow):
         self.dllay.insertWidget(self.dllay.count() - 1, widget)
         self.dlbar.show()
 
+    def restart(self):
+        """Relaunch the browser (used after an update)."""
+        if getattr(self, "_instance_server", None) is not None:
+            # free the single-instance socket so the successor
+            # becomes the new primary instead of handing off to us
+            self._instance_server.close()
+            QLocalServer.removeServer(SINGLE_INSTANCE_SOCKET)
+        # successor waits for this process to exit before starting
+        os.environ["BROWSER_RESTART_WAIT"] = str(os.getpid())
+        QProcess.startDetached(sys.executable, [str(APP_DIR / "browser.py")])
+        QApplication.instance().quit()
+
     def closeEvent(self, event):
         # closing the window from the compositor (e.g. Super+Q) must end
         # the process too — a lingering ghost would hold the
@@ -753,10 +771,37 @@ class Browser(QMainWindow):
 SINGLE_INSTANCE_SOCKET = "browser-single-instance"
 
 
+def _pid_alive(pid):
+    if sys.platform == "win32":
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     # a URL argument means we were asked to open a link (e.g. as the
     # system default browser)
     url = sys.argv[1] if len(sys.argv) > 1 else None
+
+    # started by our own restart(): let the old process finish dying
+    # so the profile and socket are free
+    predecessor = os.environ.pop("BROWSER_RESTART_WAIT", None)
+    if predecessor:
+        for _ in range(60):
+            try:
+                if not _pid_alive(int(predecessor)):
+                    break
+            except ValueError:
+                break
+            time.sleep(0.1)
 
     # single instance: two instances sharing one profile breaks Chromium's
     # network/cache storage, so hand the link to the running one instead
@@ -778,6 +823,7 @@ def main():
     QLocalServer.removeServer(SINGLE_INSTANCE_SOCKET)
     server = QLocalServer()
     server.listen(SINGLE_INSTANCE_SOCKET)
+    win._instance_server = server
 
     def handoff():
         conn = server.nextPendingConnection()
