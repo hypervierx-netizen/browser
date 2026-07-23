@@ -558,6 +558,8 @@ class Browser(QMainWindow):
 
         self.tabs = TabWidget(self)
         self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(True)
+        self.tabs.tabBar().tabMoved.connect(self._tab_moved)
         self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.currentChanged.connect(self._tab_changed)
 
@@ -613,7 +615,41 @@ class Browser(QMainWindow):
         QTimer.singleShot(3000, self._check_updates)
         self._toast = None
 
-        self.new_tab(url=initial_url)
+        # groups survive restarts; saved on quit, rebuilt here
+        QApplication.instance().aboutToQuit.connect(self._save_groups)
+        self._restore_groups()
+        self.new_tab(url=initial_url, group=None)
+
+    def _save_groups(self):
+        data = []
+        for g in self.groups:
+            urls = []
+            for i in self._group_indices(g):
+                view = self.tabs.widget(i)
+                url = view.url()
+                if url == START_PAGE:
+                    urls.append("")
+                else:
+                    urls.append(url.toString()
+                                or getattr(view, "_requested", ""))
+            data.append({"name": g,
+                         "color": self.group_colors.get(g, "#6c7086"),
+                         "collapsed": bool(self.collapsed.get(g)),
+                         "urls": urls})
+        self.config["tabGroups"] = data
+        self.save_config()
+
+    def _restore_groups(self):
+        for entry in self.config.get("tabGroups", []):
+            name = entry.get("name")
+            urls = entry.get("urls", [])
+            if not name or name in self.groups or not urls:
+                continue
+            self._register_group(name, entry.get("color", "#6c7086"))
+            for url in urls:
+                self.new_tab(url=url or None, group=name, switch=False)
+            if entry.get("collapsed"):
+                self._toggle_collapse(name)
 
     # ---- updates ----
     def _check_updates(self):
@@ -730,6 +766,7 @@ class Browser(QMainWindow):
                 view.load(START_PAGE)
                 self._focus_url()
             else:
+                view._requested = url  # fallback for saving before commit
                 view.load(QUrl(url))
         return view
 
@@ -760,10 +797,7 @@ class Browser(QMainWindow):
             self.groups.remove(group)
             self.group_colors.pop(group, None)
             self.collapsed.pop(group, None)
-        bar = self.tabs.tabBar()
-        if not any(bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i))
-                   for i in range(self.tabs.count())):
-            self.new_tab()
+        self._ensure_tab_or_quit()
 
     def _cycle(self, step):
         # skip group headers and collapsed (hidden) tabs
@@ -775,6 +809,71 @@ class Browser(QMainWindow):
             if bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i)):
                 self.tabs.setCurrentIndex(i)
                 return
+
+    # ---- drag & drop between groups ----
+    def _tab_moved(self, _frm, _to):
+        """While a tab is dragged, its group follows its position:
+        inside a group's block (or onto its pill) joins it, outside
+        leaves. Qt reports every displaced tab here, so only the tab
+        actually held by the user is ever reassigned."""
+        if getattr(self, "_fixing", False):
+            return
+        w = getattr(self, "_drag_view", None)
+        if w is None:
+            return
+        to = self.tabs.indexOf(w)
+        if to < 0:
+            return
+        left = self.tabs.widget(to - 1) if to > 0 else None
+        right = (self.tabs.widget(to + 1)
+                 if to + 1 < self.tabs.count() else None)
+        if left is None:
+            lg = None
+        elif self._is_header(left):
+            lg = left.group_header
+        else:
+            lg = getattr(left, "group", None)
+        if right is not None and self._is_header(right):
+            # dropped onto the pill: merge into that group
+            target = right.group_header
+        else:
+            rg = None if right is None else getattr(right, "group", None)
+            target = lg if lg is not None and lg == rg else None
+        if target is not None and self.collapsed.get(target):
+            target = None  # no dropping into a folded group
+        w.group = target
+        self.tabs.tabBar().update()
+
+    def _fix_group_layout(self, group):
+        """Ensure the group's tabs sit contiguously after its pill."""
+        bar = self.tabs.tabBar()
+        for _ in range(self.tabs.count()):
+            h = self._header_index(group)
+            members = self._group_indices(group)
+            if h is None or not members:
+                return
+            want = set(range(h + 1, h + 1 + len(members)))
+            misplaced = [m for m in members if m not in want]
+            if not misplaced:
+                return
+            m = misplaced[0]
+            bar.moveTab(m, h + len(members) if m > h else h)
+
+    def _finalize_drag(self):
+        held = self.current()  # the tab the user was dragging stays active
+        self._fixing = True
+        try:
+            for g in list(self.groups):
+                self._fix_group_layout(g)
+        finally:
+            self._fixing = False
+        for g in list(self.groups):
+            self._cleanup_group_if_empty(g)
+        if held is not None:
+            i = self.tabs.indexOf(held)
+            if i >= 0 and not self._is_header(held):
+                self.tabs.setCurrentIndex(i)
+        self.tabs.tabBar().update()
 
     # ---- site permissions (microphone, camera, screen share) ----
     def _permission_requested(self, permission):
@@ -1066,10 +1165,25 @@ class Browser(QMainWindow):
             self.groups.remove(group)
         self.group_colors.pop(group, None)
         self.collapsed.pop(group, None)
+        self._ensure_tab_or_quit()
+
+    def _ensure_tab_or_quit(self):
+        """Closing the very last tab closes the browser, like Chrome.
+        If tabs only survive inside folded groups, unfold one instead."""
+        real = [i for i in range(self.tabs.count())
+                if not self._is_header(self.tabs.widget(i))]
+        if not real:
+            self.close()
+            return
         bar = self.tabs.tabBar()
-        if not any(bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i))
-                   for i in range(self.tabs.count())):
-            self.new_tab()
+        if not any(bar.isTabVisible(i) for i in real):
+            for g in self.groups:
+                if self.collapsed.get(g):
+                    self._toggle_collapse(g)
+                    members = self._group_indices(g)
+                    if members:
+                        self.tabs.setCurrentIndex(members[0])
+                    break
 
     # ---- navigation ----
     def _navigate(self):
@@ -1193,6 +1307,14 @@ class Browser(QMainWindow):
                 and event.type() in (QEvent.Type.MouseButtonPress,
                                      QEvent.Type.MouseButtonDblClick)):
             i = obj.tabAt(event.position().toPoint())
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self._drag_active = True
+                w0 = self.tabs.widget(i) if i >= 0 else None
+                # remember which tab the hand is on: during a drag Qt
+                # also reports the tabs being pushed aside, and only the
+                # held tab may change group membership
+                self._drag_view = (w0 if w0 is not None
+                                   and not self._is_header(w0) else None)
             if i >= 0:
                 w = self.tabs.widget(i)
                 if event.button() == Qt.MouseButton.RightButton:
@@ -1205,6 +1327,12 @@ class Browser(QMainWindow):
                     if event.button() == Qt.MouseButton.LeftButton:
                         self._header_clicked(w.group_header, i)
                     return True
+        if (obj is self.tabs.tabBar()
+                and event.type() == QEvent.Type.MouseButtonRelease
+                and getattr(self, "_drag_active", False)):
+            self._drag_active = False
+            self._drag_view = None
+            QTimer.singleShot(0, self._finalize_drag)
         return super().eventFilter(obj, event)
 
     def _tab_changed(self, index):
@@ -1218,6 +1346,11 @@ class Browser(QMainWindow):
             self.urlbar.setText("" if url == START_PAGE else url.toString())
 
     def _step_off_header(self, index):
+        # only act if the selection is still stuck on that header
+        w = self.tabs.widget(index)
+        if (self.tabs.currentIndex() != index or w is None
+                or not self._is_header(w)):
+            return
         target = self._nearest_tab(index)
         if target is not None:
             self.tabs.setCurrentIndex(target)
