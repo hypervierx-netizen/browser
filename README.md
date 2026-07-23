@@ -85,6 +85,11 @@ The theme is pitch black (#000000) with
 [Catppuccin Mocha](https://catppuccin.com/palette/) text colors.
 User data (history, settings, cookies) is stored under `~/.local/share/browser/`.
 
+## Windows version
+
+There is a Windows edition at
+[idkhowtonamemyselfasadev/browser-windows](https://github.com/idkhowtonamemyselfasadev/browser-windows).
+
 ## Uninstall
 
 ```sh
