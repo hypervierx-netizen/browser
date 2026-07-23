@@ -366,7 +366,9 @@
     <h3>Setup</h3>
     <div class="privbtns">
       <button type="button" id="rerunsetup">Run setup again</button>
+      <button type="button" id="updatebtn">Check for updates</button>
     </div>
+    <div class="hint" id="updatemsg" hidden></div>
   </div>
 <script>
   const DEFAULTS = [
@@ -618,6 +620,13 @@
       });
     }
   }
+  document.getElementById("updatebtn").onclick = (e) => {
+    if (!bridge) return;
+    e.target.disabled = true;
+    e.target.textContent = "Checking\u2026";
+    document.getElementById("updatemsg").hidden = true;
+    bridge.runUpdate();
+  };
   document.getElementById("rerunsetup").onclick = () => {
     document.getElementById("settings").classList.remove("open");
     wizStep(1);
@@ -629,6 +638,14 @@
   if (typeof qt !== "undefined") {
     new QWebChannel(qt.webChannelTransport, (ch) => {
       bridge = ch.objects.bridge;
+      bridge.updateFinished.connect((msg) => {
+        const el = document.getElementById("updatemsg");
+        el.hidden = false;
+        el.textContent = msg;
+        const b = document.getElementById("updatebtn");
+        b.disabled = false;
+        b.textContent = "Check for updates";
+      });
       syncSettings();
     });
   }

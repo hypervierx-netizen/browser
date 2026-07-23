@@ -15,8 +15,8 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     + " --blink-settings=preferredColorScheme=0")
 
 from PyQt6.QtCore import (
-    Qt, QElapsedTimer, QObject, QStringListModel, QTimer, QUrl, QUrlQuery,
-    pyqtSlot,
+    Qt, QElapsedTimer, QObject, QProcess, QStringListModel, QTimer, QUrl,
+    QUrlQuery, pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtGui import (
@@ -152,9 +152,41 @@ QToolButton#tabclose:hover { background: rgba(243, 139, 168, 70); color: #f38ba8
 class Bridge(QObject):
     """Exposed to the start/history pages via QWebChannel."""
 
+    updateFinished = pyqtSignal(str)
+
     def __init__(self, browser):
         super().__init__()
         self.browser = browser
+        self._updating = None
+
+    @pyqtSlot()
+    def runUpdate(self):
+        """Pull the newest version from GitHub (async; result via signal)."""
+        if self._updating is not None:
+            return
+        proc = QProcess(self)
+        self._updating = proc
+        proc.setWorkingDirectory(str(APP_DIR))
+        proc.finished.connect(lambda *_: self._update_done(proc))
+        proc.errorOccurred.connect(lambda *_: self._update_done(proc))
+        proc.start("git", ["pull", "--ff-only"])
+
+    def _update_done(self, proc):
+        if self._updating is not proc:
+            return
+        self._updating = None
+        out = bytes(proc.readAllStandardOutput()).decode(errors="replace")
+        err = bytes(proc.readAllStandardError()).decode(errors="replace")
+        proc.deleteLater()
+        if proc.exitStatus() != QProcess.ExitStatus.NormalExit or proc.error() == QProcess.ProcessError.FailedToStart:
+            msg = "Update needs git and a cloned copy of the repo."
+        elif proc.exitCode() != 0:
+            msg = "Update failed: " + (err.strip().splitlines() or ["unknown error"])[-1]
+        elif "Already up to date" in out:
+            msg = "You have the newest version \u2713"
+        else:
+            msg = "Updated! Close the browser (Ctrl+Q) and reopen it."
+        self.updateFinished.emit(msg)
 
     @pyqtSlot(result=bool)
     def historyEnabled(self):
