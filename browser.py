@@ -2,6 +2,7 @@
 """A minimal, island-styled web browser. Tabs, search bar, start page."""
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -15,20 +16,22 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     + " --blink-settings=preferredColorScheme=0")
 
 from PyQt6.QtCore import (
-    Qt, QElapsedTimer, QObject, QProcess, QStringListModel, QTimer, QUrl,
-    QUrlQuery, pyqtSignal, pyqtSlot,
+    QSize, Qt, QElapsedTimer, QEvent, QObject, QProcess, QStringListModel,
+    QTimer, QUrl, QUrlQuery, pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtGui import (
-    QDesktopServices, QIcon, QKeySequence, QShortcut, QGuiApplication,
+    QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPixmap,
+    QShortcut, QGuiApplication,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCompleter, QLabel, QMainWindow, QProgressBar, QWidget,
-    QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QTabWidget, QTabBar,
-    QToolButton,
+    QApplication, QCompleter, QInputDialog, QLabel, QMainWindow, QMenu,
+    QProgressBar, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit,
+    QTabWidget, QTabBar, QToolButton,
 )
 from PyQt6.QtWebEngineCore import (
-    QWebEngineProfile, QWebEnginePage, QWebEngineScript, QWebEngineSettings,
+    QWebEnginePermission, QWebEngineProfile, QWebEnginePage, QWebEngineScript,
+    QWebEngineSettings,
 )
 from PyQt6.QtNetwork import (
     QLocalServer, QLocalSocket, QNetworkAccessManager, QNetworkRequest,
@@ -70,6 +73,32 @@ GOOGLE_BLACK_JS = r"""
   (document.head || document.documentElement).appendChild(s);
 })();
 """
+
+# what a site may ask for, in words the permission bar can show
+PERMISSION_LABELS = {
+    QWebEnginePermission.PermissionType.MediaAudioCapture:
+        "use your microphone",
+    QWebEnginePermission.PermissionType.MediaVideoCapture:
+        "use your camera",
+    QWebEnginePermission.PermissionType.MediaAudioVideoCapture:
+        "use your microphone and camera",
+    QWebEnginePermission.PermissionType.DesktopVideoCapture:
+        "share your screen",
+    QWebEnginePermission.PermissionType.DesktopAudioVideoCapture:
+        "share your screen with audio",
+    QWebEnginePermission.PermissionType.Notifications:
+        "show notifications",
+}
+
+# sentinel: "new tab inherits the current tab's group"
+INHERIT_GROUP = object()
+
+# palette offered when creating a tab group
+GROUP_COLORS = [
+    ("Blue", "#89b4fa"), ("Pink", "#f38ba8"), ("Green", "#a6e3a1"),
+    ("Yellow", "#f9e2af"), ("Purple", "#cba6f7"), ("Teal", "#94e2d5"),
+    ("Orange", "#fab387"), ("Gray", "#6c7086"),
+]
 
 # domain guesses for the address bar ("wiki" -> wikipedia.org);
 # visited sites are remembered and suggested too
@@ -113,8 +142,6 @@ QTabBar::tab {
     border-radius: 0px;
     padding: 7px 6px 7px 14px;
     margin: 4px 3px 6px 3px;
-    min-width: 160px;
-    max-width: 240px;
 }
 QTabBar::tab:selected {
     background: #16161d;
@@ -149,7 +176,101 @@ QToolButton#tabclose:hover { background: rgba(243, 139, 168, 70); color: #f38ba8
 
 #toast { background: #0d0d12; border: 1px solid rgba(108, 112, 134, 110); }
 #toast QLabel { color: #cdd6f4; }
+
+QMenu {
+    background: #0d0d12;
+    color: #cdd6f4;
+    border: 1px solid rgba(108, 112, 134, 110);
+    padding: 4px;
+}
+QMenu::item { padding: 6px 18px; }
+QMenu::item:selected { background: #16161d; color: #ffffff; }
+QMenu::separator { height: 1px; background: rgba(108, 112, 134, 70); margin: 4px 8px; }
+
+QToolButton#groupbtn {
+    font-size: 15px;
+    padding: 5px 12px;
+    margin: 4px 0 6px 6px;
+    border-radius: 0px;
+}
 """
+
+
+class GroupMenu(QMenu):
+    """The book-button menu; right-clicking a group offers to delete it."""
+
+    def __init__(self, browser):
+        super().__init__(browser)
+        self.browser = browser
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            action = self.actionAt(event.position().toPoint())
+            group = action.data() if action else None
+            if group:
+                sub = QMenu(self)
+                delete = sub.addAction("Delete \u201c%s\u201d" % group)
+                chosen = sub.exec(event.globalPosition().toPoint())
+                if chosen is delete:
+                    self.browser.delete_group(group)
+                self.close()
+                return
+        super().mouseReleaseEvent(event)
+
+
+class GroupTabBar(QTabBar):
+    """Chrome-style painting: group headers as colored pills, group
+    members with a colored underline."""
+
+    def __init__(self, browser):
+        super().__init__()
+        self.browser = browser
+
+    def _tabs(self):
+        return getattr(self.browser, "tabs", None)
+
+    def tabSizeHint(self, index):
+        size = super().tabSizeHint(index)
+        tabs = self._tabs()
+        w = tabs.widget(index) if tabs else None
+        if w is not None and getattr(w, "group_header", None) is not None:
+            width = self.fontMetrics().horizontalAdvance(w.group_header) + 30
+            return QSize(max(width, 44), size.height())
+        return QSize(min(max(size.width(), 160), 240), size.height())
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        tabs = self._tabs()
+        if tabs is None:
+            return
+        painter = QPainter(self)
+        for i in range(self.count()):
+            if not self.isTabVisible(i):
+                continue
+            w = tabs.widget(i)
+            if w is None:
+                continue
+            rect = self.tabRect(i)
+            header = getattr(w, "group_header", None)
+            if header is not None:
+                color = QColor(self.browser.group_colors.get(header, "#6c7086"))
+                pill = rect.adjusted(3, 8, -3, -10)
+                painter.fillRect(pill, color)
+                painter.setPen(QColor("#000000"))
+                painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, header)
+            else:
+                group = getattr(w, "group", None)
+                if group is not None:
+                    color = QColor(self.browser.group_colors.get(group, "#6c7086"))
+                    painter.fillRect(rect.x() + 2, rect.bottom() - 2,
+                                     rect.width() - 4, 3, color)
+        painter.end()
+
+
+class TabWidget(QTabWidget):
+    def __init__(self, browser):
+        super().__init__()
+        self.setTabBar(GroupTabBar(browser))
 
 
 class Bridge(QObject):
@@ -219,6 +340,7 @@ class WebView(QWebEngineView):
         channel.registerObject("bridge", browser.bridge)
         self.page().setWebChannel(channel)
         self.page().fullScreenRequested.connect(self._fullscreen)
+        self.page().permissionRequested.connect(browser._permission_requested)
 
     def createWindow(self, wtype):
         # tab for a link opened by a page (ctrl+click, middle-click,
@@ -363,6 +485,15 @@ class Browser(QMainWindow):
         # the start page is a local file; without this it may not navigate
         # to the web (search box / quick links -> ERR_NETWORK_ACCESS_DENIED)
         s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        # let calls ring and voice chats start without a prior click
+        s.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        # some sites (Teams…) block calls on unknown browsers; the engine
+        # IS Chromium, so drop the QtWebEngine token from the identity
+        self.profile.setHttpUserAgent(
+            re.sub(r"\s?QtWebEngine/[\d.]+", "", self.profile.httpUserAgent()))
+        self._perm_queue = []
+        self._perm_widget = None
+        self._session_perms = {}
         # auto-darken pages that have no dark theme of their own
         s.setAttribute(QWebEngineSettings.WebAttribute.ForceDarkMode, True)
 
@@ -425,10 +556,21 @@ class Browser(QMainWindow):
         bar.addWidget(self.urlbar, 1)
         bar.addWidget(newtab)
 
-        self.tabs = QTabWidget()
+        self.tabs = TabWidget(self)
         self.tabs.setDocumentMode(True)
         self.tabs.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.currentChanged.connect(self._tab_changed)
+
+        # Chrome-style tab groups: a colored name label sits in the tab
+        # strip before its tabs; clicking it collapses/expands the group
+        self.groups = []
+        self.group_colors = {}
+        self.collapsed = {}
+        self._book = QToolButton(text="\uf02d", objectName="groupbtn")
+        self._book.setToolTip("Tab groups")
+        self._book.clicked.connect(self._group_menu)
+        self.tabs.setCornerWidget(self._book, Qt.Corner.TopLeftCorner)
+        self.tabs.tabBar().installEventFilter(self)
 
         self.chrome = QWidget(objectName="chrome")
         lay = QVBoxLayout(self.chrome)
@@ -563,20 +705,23 @@ class Browser(QMainWindow):
     def current(self):
         return self.tabs.currentWidget()
 
-    def new_tab(self, url=None, switch=True, blank=False):
+    def new_tab(self, url=None, switch=True, blank=False,
+                group=INHERIT_GROUP):
         view = WebView(self, self.profile)
+        if group is INHERIT_GROUP:
+            group = self._group_of(self.current())
+        view.group = group
         view.urlChanged.connect(lambda u, v=view: self._url_changed(v, u))
         view.titleChanged.connect(lambda t, v=view: self._title_changed(v, t))
-        i = self.tabs.addTab(view, "New tab")
+        if group is not None:
+            if self.collapsed.get(group):
+                self._toggle_collapse(group)
+            block = [self._header_index(group)] + self._group_indices(group)
+            i = self.tabs.insertTab(max(block) + 1, view, "New tab")
+        else:
+            i = self.tabs.addTab(view, "New tab")
 
-        close = QToolButton(text="✕", objectName="tabclose")
-        close.clicked.connect(lambda _, v=view: self.close_tab(self.tabs.indexOf(v)))
-        # wrapper centers the circle between the tab text and the tab's right wall
-        holder = QWidget()
-        hl = QHBoxLayout(holder)
-        hl.setContentsMargins(0, 0, 6, 0)
-        hl.addWidget(close)
-        self.tabs.tabBar().setTabButton(i, QTabBar.ButtonPosition.RightSide, holder)
+        self._add_close_button(i, view)
 
         if switch:
             self.tabs.setCurrentIndex(i)
@@ -588,17 +733,343 @@ class Browser(QMainWindow):
                 view.load(QUrl(url))
         return view
 
+    def _add_close_button(self, index, view):
+        close = QToolButton(text="✕", objectName="tabclose")
+        close.clicked.connect(lambda _, v=view: self.close_tab(self.tabs.indexOf(v)))
+        # wrapper centers the circle between the tab text and the tab's right wall
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 6, 0)
+        hl.addWidget(close)
+        self.tabs.tabBar().setTabButton(index, QTabBar.ButtonPosition.RightSide, holder)
+
     def close_tab(self, index):
-        if self.tabs.count() == 1:
-            # closing the last tab gives a fresh start page, not a dead window
-            self.new_tab()
         w = self.tabs.widget(index)
+        if w is None or self._is_header(w):
+            return
+        group = self._group_of(w)
         self.tabs.removeTab(index)
         w.deleteLater()
+        # a group whose last tab closes disappears, like in Chrome
+        if group is not None and not self._group_indices(group):
+            h = self._header_index(group)
+            if h is not None:
+                hw = self.tabs.widget(h)
+                self.tabs.removeTab(h)
+                hw.deleteLater()
+            self.groups.remove(group)
+            self.group_colors.pop(group, None)
+            self.collapsed.pop(group, None)
+        bar = self.tabs.tabBar()
+        if not any(bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i))
+                   for i in range(self.tabs.count())):
+            self.new_tab()
 
     def _cycle(self, step):
-        self.tabs.setCurrentIndex(
-            (self.tabs.currentIndex() + step) % self.tabs.count())
+        # skip group headers and collapsed (hidden) tabs
+        bar = self.tabs.tabBar()
+        n = self.tabs.count()
+        i = self.tabs.currentIndex()
+        for _ in range(n):
+            i = (i + step) % n
+            if bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i)):
+                self.tabs.setCurrentIndex(i)
+                return
+
+    # ---- site permissions (microphone, camera, screen share) ----
+    def _permission_requested(self, permission):
+        label = PERMISSION_LABELS.get(permission.permissionType())
+        if label is None:
+            return  # let the engine keep its default for exotic requests
+        origin = permission.origin().host() or permission.origin().toString()
+        key = "%s|%s" % (origin, permission.permissionType().name)
+        if self.config.get("permissions", {}).get(key):
+            permission.grant()
+            return
+        if key in self._session_perms:
+            permission.grant() if self._session_perms[key] else permission.deny()
+            return
+        self._perm_queue.append((permission, origin, label, key))
+        self._next_permission()
+
+    def _next_permission(self):
+        if self._perm_widget is not None or not self._perm_queue:
+            return
+        permission, origin, label, key = self._perm_queue.pop(0)
+        bar = QWidget(self, objectName="toast")
+        bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(14, 8, 8, 8)
+        lay.setSpacing(10)
+        lay.addWidget(QLabel("%s wants to %s" % (origin, label)))
+        allow = QToolButton(text="Allow")
+        deny = QToolButton(text="Deny")
+        lay.addWidget(allow)
+        lay.addWidget(deny)
+        self._perm_widget = bar
+
+        def decide(granted):
+            permission.grant() if granted else permission.deny()
+            self._session_perms[key] = granted
+            if granted:  # only allows are remembered across restarts
+                self.config.setdefault("permissions", {})[key] = True
+                self.save_config()
+            bar.deleteLater()
+            self._perm_widget = None
+            self._next_permission()
+
+        allow.clicked.connect(lambda: decide(True))
+        deny.clicked.connect(lambda: decide(False))
+        bar.adjustSize()
+        bar.move(max(0, (self.width() - bar.width()) // 2), 54)
+        bar.show()
+        bar.raise_()
+
+    # ---- tab groups (Chrome-style inline headers) ----
+    def _group_of(self, widget):
+        if widget is None or self._is_header(widget):
+            return None
+        return getattr(widget, "group", None)
+
+    def _is_header(self, widget):
+        return getattr(widget, "group_header", None) is not None
+
+    def _header_index(self, group):
+        for i in range(self.tabs.count()):
+            if getattr(self.tabs.widget(i), "group_header", None) == group:
+                return i
+        return None
+
+    def _group_indices(self, group):
+        return [i for i in range(self.tabs.count())
+                if not self._is_header(self.tabs.widget(i))
+                and getattr(self.tabs.widget(i), "group", None) == group]
+
+    def _group_dot(self, group):
+        pix = QPixmap(12, 12)
+        pix.fill(QColor(self.group_colors.get(group, "#6c7086")))
+        return QIcon(pix)
+
+    def _group_menu(self):
+        menu = GroupMenu(self)
+        for g in self.groups:
+            action = menu.addAction(self._group_dot(g), g)
+            action.setData(g)
+            action.triggered.connect(lambda _, g=g: self._goto_group(g))
+        if self.groups:
+            menu.addSeparator()
+        menu.addAction("New group\u2026").triggered.connect(self._new_group)
+        menu.exec(self._book.mapToGlobal(self._book.rect().bottomLeft()))
+
+    def _prompt_group(self):
+        """Ask for a name and color; returns (name, color) or None."""
+        name, ok = QInputDialog.getText(self, "New group", "Group name:")
+        name = name.strip()
+        if not ok or not name or name in self.groups:
+            return None
+        picker = QMenu(self)
+        for label, color in GROUP_COLORS:
+            pix = QPixmap(12, 12)
+            pix.fill(QColor(color))
+            picker.addAction(QIcon(pix), label).setData(color)
+        chosen = picker.exec(
+            self._book.mapToGlobal(self._book.rect().bottomLeft()))
+        fallback = GROUP_COLORS[len(self.groups) % len(GROUP_COLORS)][1]
+        return name, (chosen.data() if chosen else fallback)
+
+    def _register_group(self, name, color, at=None):
+        self.groups.append(name)
+        self.group_colors[name] = color
+        self.collapsed[name] = False
+        header = QWidget()
+        header.group_header = name
+        if at is None:
+            self.tabs.addTab(header, name)
+        else:
+            self.tabs.insertTab(at, header, name)
+        self.tabs.tabBar().update()
+
+    def _new_group(self):
+        result = self._prompt_group()
+        if result is None:
+            return
+        self._register_group(*result)
+        self.new_tab(group=result[0])  # every group starts with a fresh tab
+
+    def _tab_to_new_group(self, index):
+        result = self._prompt_group()
+        if result is None:
+            return
+        view = self.tabs.widget(index)
+        self._register_group(*result, at=index)  # header lands before the tab
+        view.group = result[0]
+        self.tabs.tabBar().update()
+
+    def _move_tab_to_group(self, index, group):
+        view = self.tabs.widget(index)
+        old = self._group_of(view)
+        if old == group:
+            return
+        title = self.tabs.tabText(index)
+        was_current = view is self.current()
+        self.tabs.removeTab(index)
+        view.group = group
+        if group is not None:
+            if self.collapsed.get(group):
+                self._toggle_collapse(group)
+            block = [self._header_index(group)] + self._group_indices(group)
+            j = self.tabs.insertTab(max(block) + 1, view, title)
+        else:
+            j = self.tabs.addTab(view, title)
+        self._add_close_button(j, view)
+        if was_current:
+            self.tabs.setCurrentIndex(j)
+        if old is not None:
+            self._cleanup_group_if_empty(old)
+        self.tabs.tabBar().update()
+
+    def _cleanup_group_if_empty(self, group):
+        if self._group_indices(group):
+            return
+        h = self._header_index(group)
+        if h is not None:
+            hw = self.tabs.widget(h)
+            self.tabs.removeTab(h)
+            hw.deleteLater()
+        if group in self.groups:
+            self.groups.remove(group)
+        self.group_colors.pop(group, None)
+        self.collapsed.pop(group, None)
+
+    def _rename_group(self, old, new):
+        new = new.strip()
+        if not new or new in self.groups or old not in self.groups:
+            return
+        for i in self._group_indices(old):
+            self.tabs.widget(i).group = new
+        h = self._header_index(old)
+        if h is not None:
+            self.tabs.widget(h).group_header = new
+            self.tabs.setTabText(h, new)
+        self.groups[self.groups.index(old)] = new
+        self.group_colors[new] = self.group_colors.pop(old, "#6c7086")
+        self.collapsed[new] = self.collapsed.pop(old, False)
+        self.tabs.tabBar().update()
+
+    def ungroup(self, group):
+        """Dissolve the group but keep its tabs, like Chrome's Ungroup."""
+        if self.collapsed.get(group):
+            self._toggle_collapse(group)
+        for i in self._group_indices(group):
+            self.tabs.widget(i).group = None
+        h = self._header_index(group)
+        if h is not None:
+            hw = self.tabs.widget(h)
+            self.tabs.removeTab(h)
+            hw.deleteLater()
+        if group in self.groups:
+            self.groups.remove(group)
+        self.group_colors.pop(group, None)
+        self.collapsed.pop(group, None)
+        self.tabs.tabBar().update()
+
+    def _tab_menu(self, index):
+        view = self.tabs.widget(index)
+        group = self._group_of(view)
+        menu = QMenu(self)
+        if group is None:
+            menu.addAction("Add tab to new group\u2026").triggered.connect(
+                lambda: self._tab_to_new_group(self.tabs.indexOf(view)))
+            if self.groups:
+                sub = menu.addMenu("Add tab to group")
+                for g in self.groups:
+                    sub.addAction(self._group_dot(g), g).triggered.connect(
+                        lambda _, g=g: self._move_tab_to_group(
+                            self.tabs.indexOf(view), g))
+        else:
+            menu.addAction("New tab in group").triggered.connect(
+                lambda: self.new_tab(group=group))
+            menu.addAction("Remove from group").triggered.connect(
+                lambda: self._move_tab_to_group(self.tabs.indexOf(view), None))
+        menu.addSeparator()
+        menu.addAction("Close tab").triggered.connect(
+            lambda: self.close_tab(self.tabs.indexOf(view)))
+        bar = self.tabs.tabBar()
+        menu.exec(bar.mapToGlobal(bar.tabRect(index).bottomLeft()))
+
+    def _header_menu(self, index):
+        group = self.tabs.widget(index).group_header
+        menu = QMenu(self)
+        menu.addAction("New tab in group").triggered.connect(
+            lambda: self.new_tab(group=group))
+        menu.addAction("Rename\u2026").triggered.connect(
+            lambda: self._rename_dialog(group))
+        colors = menu.addMenu("Color")
+        for label, color in GROUP_COLORS:
+            pix = QPixmap(12, 12)
+            pix.fill(QColor(color))
+            colors.addAction(QIcon(pix), label).triggered.connect(
+                lambda _, c=color: self._set_group_color(group, c))
+        menu.addSeparator()
+        menu.addAction("Ungroup").triggered.connect(
+            lambda: self.ungroup(group))
+        menu.addAction("Close group").triggered.connect(
+            lambda: self.delete_group(group))
+        bar = self.tabs.tabBar()
+        menu.exec(bar.mapToGlobal(bar.tabRect(index).bottomLeft()))
+
+    def _rename_dialog(self, group):
+        name, ok = QInputDialog.getText(
+            self, "Rename group", "Group name:", text=group)
+        if ok:
+            self._rename_group(group, name)
+
+    def _set_group_color(self, group, color):
+        if group in self.group_colors:
+            self.group_colors[group] = color
+            self.tabs.tabBar().update()
+
+    def _goto_group(self, group):
+        if self.collapsed.get(group):
+            self._toggle_collapse(group)
+        members = self._group_indices(group)
+        if members:
+            self.tabs.setCurrentIndex(members[0])
+
+    def _toggle_collapse(self, group):
+        self.collapsed[group] = not self.collapsed.get(group, False)
+        bar = self.tabs.tabBar()
+        for i in self._group_indices(group):
+            bar.setTabVisible(i, not self.collapsed[group])
+
+    def _nearest_tab(self, index):
+        bar = self.tabs.tabBar()
+        order = list(range(index + 1, self.tabs.count()))
+        order += list(range(index - 1, -1, -1))
+        for i in order:
+            if bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i)):
+                return i
+        return None
+
+    def delete_group(self, group):
+        """Close the group's tabs and its header."""
+        for i in reversed(self._group_indices(group)):
+            w = self.tabs.widget(i)
+            self.tabs.removeTab(i)
+            w.deleteLater()
+        h = self._header_index(group)
+        if h is not None:
+            hw = self.tabs.widget(h)
+            self.tabs.removeTab(h)
+            hw.deleteLater()
+        if group in self.groups:
+            self.groups.remove(group)
+        self.group_colors.pop(group, None)
+        self.collapsed.pop(group, None)
+        bar = self.tabs.tabBar()
+        if not any(bar.isTabVisible(i) and not self._is_header(self.tabs.widget(i))
+                   for i in range(self.tabs.count())):
+            self.new_tab()
 
     # ---- navigation ----
     def _navigate(self):
@@ -715,11 +1186,59 @@ class Browser(QMainWindow):
         except OSError:
             pass
 
-    def _tab_changed(self, _index):
-        view = self.current()
-        if view:
-            url = view.url()
+    def eventFilter(self, obj, event):
+        # group headers act as fold/unfold buttons: swallow their clicks
+        # before Qt selects them, so the page never flashes
+        if (obj is self.tabs.tabBar()
+                and event.type() in (QEvent.Type.MouseButtonPress,
+                                     QEvent.Type.MouseButtonDblClick)):
+            i = obj.tabAt(event.position().toPoint())
+            if i >= 0:
+                w = self.tabs.widget(i)
+                if event.button() == Qt.MouseButton.RightButton:
+                    if self._is_header(w):
+                        self._header_menu(i)
+                    else:
+                        self._tab_menu(i)
+                    return True
+                if self._is_header(w):
+                    if event.button() == Qt.MouseButton.LeftButton:
+                        self._header_clicked(w.group_header, i)
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _tab_changed(self, index):
+        w = self.tabs.widget(index)
+        if w is not None and self._is_header(w):
+            # selection landed on a header some indirect way: step off it
+            QTimer.singleShot(0, lambda: self._step_off_header(index))
+            return
+        if w is not None and hasattr(w, "url"):
+            url = w.url()
             self.urlbar.setText("" if url == START_PAGE else url.toString())
+
+    def _step_off_header(self, index):
+        target = self._nearest_tab(index)
+        if target is not None:
+            self.tabs.setCurrentIndex(target)
+
+    def _header_clicked(self, group, index):
+        bar = self.tabs.tabBar()
+        if not self.collapsed.get(group, False):
+            # about to collapse: leave the group BEFORE its tabs hide,
+            # otherwise Qt momentarily selects the header (flash)
+            cur = self.tabs.currentIndex()
+            if self._group_of(self.tabs.widget(cur)) == group:
+                outside = [i for i in range(self.tabs.count())
+                           if bar.isTabVisible(i)
+                           and not self._is_header(self.tabs.widget(i))
+                           and self._group_of(self.tabs.widget(i)) != group]
+                if outside:
+                    self.tabs.setCurrentIndex(
+                        min(outside, key=lambda i: abs(i - cur)))
+                else:
+                    self.new_tab(group=None)  # fresh ungrouped tab
+        self._toggle_collapse(group)
 
     # ---- misc ----
     def set_fullscreen(self, on):
