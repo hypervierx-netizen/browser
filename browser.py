@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import uuid
 import time
 from pathlib import Path
 
@@ -236,7 +237,31 @@ class GroupTabBar(QTabBar):
         if w is not None and getattr(w, "group_header", None) is not None:
             width = self.fontMetrics().horizontalAdvance(w.group_header) + 30
             return QSize(max(width, 44), size.height())
-        return QSize(min(max(size.width(), 160), 240), size.height())
+        if tabs is None:
+            return QSize(min(max(size.width(), 160), 240), size.height())
+        # tabs share the bar width and shrink as more open, like Chrome
+        members = 0
+        pills = 0
+        for i in range(self.count()):
+            if not self.isTabVisible(i):
+                continue
+            wi = tabs.widget(i)
+            if wi is None:
+                continue
+            if getattr(wi, "group_header", None) is not None:
+                pills += (self.fontMetrics().horizontalAdvance(wi.group_header)
+                          + 30 + 6)
+            else:
+                members += 1
+        available = self.width() - pills - 10
+        share = available // max(1, members) - 6  # per-tab margins
+        return QSize(max(34, min(240, share)), size.height())
+
+    def tabLayoutChange(self):
+        super().tabLayoutChange()
+        update = getattr(self.browser, "_update_close_buttons", None)
+        if update is not None and getattr(self.browser, "tabs", None):
+            update()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -322,6 +347,19 @@ class Bridge(QObject):
         self.browser.save_config()
 
     @pyqtSlot(result=str)
+    def getStartData(self):
+        """Start-page setup shared across all cookie jars."""
+        return json.dumps(self.browser.config.get("startPage", {}))
+
+    @pyqtSlot(str)
+    def setStartData(self, data):
+        try:
+            self.browser.config["startPage"] = json.loads(data)
+        except ValueError:
+            return
+        self.browser.save_config()
+
+    @pyqtSlot(result=str)
     def getHistory(self):
         return json.dumps(self.browser.history)
 
@@ -335,12 +373,22 @@ class WebView(QWebEngineView):
     def __init__(self, browser, profile):
         super().__init__()
         self.browser = browser
-        self.setPage(QWebEnginePage(profile, self))
-        channel = QWebChannel(self.page())
-        channel.registerObject("bridge", browser.bridge)
-        self.page().setWebChannel(channel)
-        self.page().fullScreenRequested.connect(self._fullscreen)
-        self.page().permissionRequested.connect(browser._permission_requested)
+        self.attach_profile(profile)
+
+    def attach_profile(self, profile):
+        old = self.page()
+        page = QWebEnginePage(profile, self)
+        channel = QWebChannel(page)
+        channel.registerObject("bridge", self.browser.bridge)
+        page.setWebChannel(channel)
+        page.fullScreenRequested.connect(self._fullscreen)
+        page.permissionRequested.connect(self.browser._permission_requested)
+        self.setPage(page)
+        if old is not None and old is not page:
+            try:
+                old.deleteLater()
+            except RuntimeError:
+                pass  # Qt already disposed of the replaced page
 
     def createWindow(self, wtype):
         # tab for a link opened by a page (ctrl+click, middle-click,
@@ -475,35 +523,10 @@ class Browser(QMainWindow):
             self.history = []
         self.bridge = Bridge(self)
 
-        self.profile = QWebEngineProfile("browser", self)
-        self.profile.setPersistentCookiesPolicy(
-            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-        self.profile.downloadRequested.connect(self._download)
-        s = self.profile.settings()
-        s.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
-        s.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
-        # the start page is a local file; without this it may not navigate
-        # to the web (search box / quick links -> ERR_NETWORK_ACCESS_DENIED)
-        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-        # let calls ring and voice chats start without a prior click
-        s.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
-        # some sites (Teams…) block calls on unknown browsers; the engine
-        # IS Chromium, so drop the QtWebEngine token from the identity
-        self.profile.setHttpUserAgent(
-            re.sub(r"\s?QtWebEngine/[\d.]+", "", self.profile.httpUserAgent()))
+        self.profile = self._make_profile("browser")
         self._perm_queue = []
         self._perm_widget = None
         self._session_perms = {}
-        # auto-darken pages that have no dark theme of their own
-        s.setAttribute(QWebEngineSettings.WebAttribute.ForceDarkMode, True)
-
-        script = QWebEngineScript()
-        script.setName("google-black")
-        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
-        script.setRunsOnSubFrames(False)
-        script.setSourceCode(GOOGLE_BLACK_JS)
-        self.profile.scripts().insert(script)
 
         # top island bar: nav buttons + url bar
         self.urlbar = QLineEdit(objectName="urlbar")
@@ -568,6 +591,12 @@ class Browser(QMainWindow):
         self.groups = []
         self.group_colors = {}
         self.collapsed = {}
+        self.group_ids = {}
+        self.group_profiles = {}
+        self.group_sessions = {}
+        self.sessions = [{"name": "Browser 1", "sid": "main"}]
+        self.active_session = "main"
+        self.session_profiles = {}
         self._book = QToolButton(text="\uf02d", objectName="groupbtn")
         self._book.setToolTip("Tab groups")
         self._book.clicked.connect(self._group_menu)
@@ -578,6 +607,13 @@ class Browser(QMainWindow):
         lay = QVBoxLayout(self.chrome)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
+        # virtual browsers: each entry up here is a full browser with
+        # its own cookies and its own tabs
+        self.sessrow = QWidget(objectName="sessrow")
+        self.sesslay = QHBoxLayout(self.sessrow)
+        self.sesslay.setContentsMargins(8, 4, 8, 0)
+        self.sesslay.setSpacing(6)
+        lay.addWidget(self.sessrow)
         lay.addLayout(bar)
 
         # download bar (hidden until a download starts)
@@ -615,10 +651,19 @@ class Browser(QMainWindow):
         QTimer.singleShot(3000, self._check_updates)
         self._toast = None
 
-        # groups survive restarts; saved on quit, rebuilt here
+        # virtual browsers and groups survive restarts
         QApplication.instance().aboutToQuit.connect(self._save_groups)
+        saved_sessions = [e for e in self.config.get("sessions", [])
+                          if e.get("sid") and e.get("name")]
+        if saved_sessions:
+            self.sessions = saved_sessions
+            if not any(e["sid"] == "main" for e in self.sessions):
+                self.sessions.insert(0, {"name": "Browser 1", "sid": "main"})
+        self.active_session = self.sessions[0]["sid"]
         self._restore_groups()
-        self.new_tab(url=initial_url, group=None)
+        self.new_tab(url=initial_url, group=None,
+                     session=self.active_session)
+        self.switch_session(self.active_session)
 
     def _save_groups(self):
         data = []
@@ -635,8 +680,11 @@ class Browser(QMainWindow):
             data.append({"name": g,
                          "color": self.group_colors.get(g, "#6c7086"),
                          "collapsed": bool(self.collapsed.get(g)),
+                         "gid": self.group_ids.get(g),
+                         "session": self.group_sessions.get(g, "main"),
                          "urls": urls})
         self.config["tabGroups"] = data
+        self.config["sessions"] = self.sessions
         self.save_config()
 
     def _restore_groups(self):
@@ -645,7 +693,13 @@ class Browser(QMainWindow):
             urls = entry.get("urls", [])
             if not name or name in self.groups or not urls:
                 continue
-            self._register_group(name, entry.get("color", "#6c7086"))
+            if entry.get("gid"):
+                self.group_ids[name] = entry["gid"]
+            session = entry.get("session", "main")
+            if not any(e["sid"] == session for e in self.sessions):
+                session = "main"
+            self._register_group(name, entry.get("color", "#6c7086"),
+                                 session=session)
             for url in urls:
                 self.new_tab(url=url or None, group=name, switch=False)
             if entry.get("collapsed"):
@@ -658,8 +712,14 @@ class Browser(QMainWindow):
             return
         fetch = QProcess(self)
         fetch.setWorkingDirectory(str(APP_DIR))
-        fetch.finished.connect(lambda *_: (fetch.deleteLater(),
-                                           self._count_behind()))
+
+        def fetched(*_):
+            try:
+                fetch.deleteLater()
+            except RuntimeError:
+                return  # quitting while the check was in flight
+            self._count_behind()
+        fetch.finished.connect(fetched)
         fetch.start("git", ["fetch", "--quiet"])
 
     def _count_behind(self):
@@ -667,9 +727,13 @@ class Browser(QMainWindow):
         proc.setWorkingDirectory(str(APP_DIR))
 
         def done(*_):
-            out = bytes(proc.readAllStandardOutput()).decode().strip()
-            proc.deleteLater()
-            if proc.exitCode() == 0 and out.isdigit() and int(out) > 0:
+            try:
+                out = bytes(proc.readAllStandardOutput()).decode().strip()
+                code = proc.exitCode()
+                proc.deleteLater()
+            except RuntimeError:
+                return  # quitting while the check was in flight
+            if code == 0 and out.isdigit() and int(out) > 0:
                 self._show_toast()
         proc.finished.connect(done)
         proc.start("git", ["rev-list", "--count", "HEAD..@{u}"])
@@ -742,13 +806,18 @@ class Browser(QMainWindow):
         return self.tabs.currentWidget()
 
     def new_tab(self, url=None, switch=True, blank=False,
-                group=INHERIT_GROUP):
-        view = WebView(self, self.profile)
+                group=INHERIT_GROUP, session=None):
         if group is INHERIT_GROUP:
             group = self._group_of(self.current())
+        if session is None:
+            session = (self.group_sessions.get(group)
+                       if group is not None else self.active_session)
+        view = WebView(self, self._profile_for(group, session))
         view.group = group
+        view.session = session or "main"
         view.urlChanged.connect(lambda u, v=view: self._url_changed(v, u))
         view.titleChanged.connect(lambda t, v=view: self._title_changed(v, t))
+        view.iconChanged.connect(lambda ic, v=view: self._icon_changed(v, ic))
         if group is not None:
             if self.collapsed.get(group):
                 self._toggle_collapse(group)
@@ -869,11 +938,125 @@ class Browser(QMainWindow):
             self._fixing = False
         for g in list(self.groups):
             self._cleanup_group_if_empty(g)
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if not self._is_header(w):
+                self._sync_profile(w)
         if held is not None:
             i = self.tabs.indexOf(held)
             if i >= 0 and not self._is_header(held):
                 self.tabs.setCurrentIndex(i)
         self.tabs.tabBar().update()
+
+    # ---- virtual browsers ----
+    def _update_session_bar(self):
+        lay = self.sesslay
+        while lay.count():
+            item = lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for entry in self.sessions:
+            active = entry["sid"] == self.active_session
+            b = QToolButton(text=entry["name"])
+            b.setStyleSheet(
+                "QToolButton { background: %s; color: %s; border: 1px solid %s;"
+                " border-radius: 0px; padding: 4px 14px; font-weight: %s; }"
+                % (("#16161d", "#ffffff", "#a6adc8", "bold") if active
+                   else ("#0d0d12", "#6c7086", "rgba(108, 112, 134, 60)", "normal")))
+            b.clicked.connect(lambda _, sid=entry["sid"]: self.switch_session(sid))
+            b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            b.customContextMenuRequested.connect(
+                lambda _p, sid=entry["sid"], b=b: self._session_menu(b, sid))
+            lay.addWidget(b)
+        plus = QToolButton(text="+")
+        plus.setToolTip("New virtual browser (own cookies and tabs)")
+        plus.setStyleSheet("QToolButton { background: #0d0d12; color: #6c7086;"
+                           " border: 1px solid rgba(108, 112, 134, 60);"
+                           " border-radius: 0px; padding: 4px 10px; }")
+        plus.clicked.connect(self._add_session)
+        lay.addWidget(plus)
+        lay.addStretch()
+
+    def switch_session(self, sid):
+        self.active_session = sid
+        bar = self.tabs.tabBar()
+        first = None
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            in_session = getattr(w, "session", "main") == sid
+            if self._is_header(w):
+                visible = in_session
+            else:
+                g = getattr(w, "group", None)
+                visible = in_session and not (g and self.collapsed.get(g))
+            bar.setTabVisible(i, visible)
+            if visible and not self._is_header(w) and first is None:
+                first = i
+        self._update_session_bar()
+        current = self.current()
+        if (current is None or self._is_header(current)
+                or getattr(current, "session", "main") != sid):
+            if first is not None:
+                self.tabs.setCurrentIndex(first)
+            else:
+                self.new_tab(group=None)  # fresh, ungrouped, this browser
+        bar.update()
+
+    def _add_session(self):
+        names = {e["name"] for e in self.sessions}
+        n = 2
+        while "Browser %d" % n in names:
+            n += 1
+        name, ok = QInputDialog.getText(
+            self, "New browser", "Name:", text="Browser %d" % n)
+        name = name.strip()
+        if not ok or not name:
+            return
+        while name in names:
+            name += " 2"
+        self.sessions.append({"name": name, "sid": uuid.uuid4().hex[:8]})
+        self.switch_session(self.sessions[-1]["sid"])
+
+    def _session_menu(self, button, sid):
+        menu = QMenu(self)
+        name = next((e["name"] for e in self.sessions if e["sid"] == sid), sid)
+        rename = menu.addAction("Rename\u2026")
+        close = menu.addAction("Close \u201c%s\u201d" % name)
+        close.setEnabled(len(self.sessions) > 1)
+        chosen = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
+        if chosen is close:
+            self._close_session(sid)
+        elif chosen is rename:
+            new, ok = QInputDialog.getText(
+                self, "Rename browser", "Name:", text=name)
+            new = new.strip()
+            if ok and new and all(e["name"] != new for e in self.sessions):
+                for entry in self.sessions:
+                    if entry["sid"] == sid:
+                        entry["name"] = new
+                self._update_session_bar()
+
+    def _close_session(self, sid):
+        if len(self.sessions) <= 1:
+            return
+        for i in reversed(range(self.tabs.count())):
+            w = self.tabs.widget(i)
+            if getattr(w, "session", "main") == sid:
+                self.tabs.removeTab(i)
+                w.deleteLater()
+        for g in [g for g, s in list(self.group_sessions.items()) if s == sid]:
+            if g in self.groups:
+                self.groups.remove(g)
+            self.group_colors.pop(g, None)
+            self.collapsed.pop(g, None)
+            self.group_ids.pop(g, None)
+            self.group_sessions.pop(g, None)
+        self.sessions = [e for e in self.sessions if e["sid"] != sid]
+        self.session_profiles.pop(sid, None)
+        if self.active_session == sid:
+            self.switch_session(self.sessions[0]["sid"])
+        else:
+            self._update_session_bar()
 
     # ---- site permissions (microphone, camera, screen share) ----
     def _permission_requested(self, permission):
@@ -951,11 +1134,13 @@ class Browser(QMainWindow):
 
     def _group_menu(self):
         menu = GroupMenu(self)
-        for g in self.groups:
+        listed = [g for g in self.groups
+                  if self.group_sessions.get(g, "main") == self.active_session]
+        for g in listed:
             action = menu.addAction(self._group_dot(g), g)
             action.setData(g)
             action.triggered.connect(lambda _, g=g: self._goto_group(g))
-        if self.groups:
+        if listed:
             menu.addSeparator()
         menu.addAction("New group\u2026").triggered.connect(self._new_group)
         menu.exec(self._book.mapToGlobal(self._book.rect().bottomLeft()))
@@ -976,12 +1161,15 @@ class Browser(QMainWindow):
         fallback = GROUP_COLORS[len(self.groups) % len(GROUP_COLORS)][1]
         return name, (chosen.data() if chosen else fallback)
 
-    def _register_group(self, name, color, at=None):
+    def _register_group(self, name, color, at=None, session=None):
         self.groups.append(name)
         self.group_colors[name] = color
         self.collapsed[name] = False
+        session = session or self.active_session
+        self.group_sessions[name] = session
         header = QWidget()
         header.group_header = name
+        header.session = session
         if at is None:
             self.tabs.addTab(header, name)
         else:
@@ -1002,6 +1190,7 @@ class Browser(QMainWindow):
         view = self.tabs.widget(index)
         self._register_group(*result, at=index)  # header lands before the tab
         view.group = result[0]
+        self._sync_profile(view)
         self.tabs.tabBar().update()
 
     def _move_tab_to_group(self, index, group):
@@ -1020,7 +1209,9 @@ class Browser(QMainWindow):
             j = self.tabs.insertTab(max(block) + 1, view, title)
         else:
             j = self.tabs.addTab(view, title)
+        self.tabs.setTabIcon(j, view.icon())
         self._add_close_button(j, view)
+        self._sync_profile(view)
         if was_current:
             self.tabs.setCurrentIndex(j)
         if old is not None:
@@ -1053,6 +1244,8 @@ class Browser(QMainWindow):
         self.groups[self.groups.index(old)] = new
         self.group_colors[new] = self.group_colors.pop(old, "#6c7086")
         self.collapsed[new] = self.collapsed.pop(old, False)
+        if old in self.group_ids:
+            self.group_ids[new] = self.group_ids.pop(old)
         self.tabs.tabBar().update()
 
     def ungroup(self, group):
@@ -1060,7 +1253,9 @@ class Browser(QMainWindow):
         if self.collapsed.get(group):
             self._toggle_collapse(group)
         for i in self._group_indices(group):
-            self.tabs.widget(i).group = None
+            member = self.tabs.widget(i)
+            member.group = None
+            self._sync_profile(member)
         h = self._header_index(group)
         if h is not None:
             hw = self.tabs.widget(h)
@@ -1169,16 +1364,25 @@ class Browser(QMainWindow):
 
     def _ensure_tab_or_quit(self):
         """Closing the very last tab closes the browser, like Chrome.
-        If tabs only survive inside folded groups, unfold one instead."""
+        Other virtual browsers keep this one alive with a fresh tab;
+        tabs surviving only in folded groups unfold instead."""
         real = [i for i in range(self.tabs.count())
                 if not self._is_header(self.tabs.widget(i))]
         if not real:
             self.close()
             return
+        mine = [i for i in real
+                if getattr(self.tabs.widget(i), "session", "main")
+                == self.active_session]
+        if not mine:
+            self.new_tab(group=None)
+            return
         bar = self.tabs.tabBar()
-        if not any(bar.isTabVisible(i) for i in real):
+        if not any(bar.isTabVisible(i) for i in mine):
             for g in self.groups:
-                if self.collapsed.get(g):
+                if (self.collapsed.get(g)
+                        and self.group_sessions.get(g, "main")
+                        == self.active_session):
                     self._toggle_collapse(g)
                     members = self._group_indices(g)
                     if members:
@@ -1264,6 +1468,24 @@ class Browser(QMainWindow):
             self.urlbar.setText("" if url == START_PAGE else url.toString())
             self.urlbar.setCursorPosition(0)
 
+    def _update_close_buttons(self):
+        """Very small tabs show just the site icon: the close button
+        survives only on the active tab, like Chrome."""
+        bar = self.tabs.tabBar()
+        current = self.tabs.currentIndex()
+        for i in range(self.tabs.count()):
+            holder = bar.tabButton(i, QTabBar.ButtonPosition.RightSide)
+            if holder is None:
+                continue
+            want = bar.tabRect(i).width() >= 90 or i == current
+            if holder.isVisibleTo(bar) != want:
+                holder.setVisible(want)
+
+    def _icon_changed(self, view, icon):
+        i = self.tabs.indexOf(view)
+        if i >= 0:
+            self.tabs.setTabIcon(i, icon)
+
     def _title_changed(self, view, title):
         i = self.tabs.indexOf(view)
         if i >= 0:
@@ -1344,6 +1566,7 @@ class Browser(QMainWindow):
         if w is not None and hasattr(w, "url"):
             url = w.url()
             self.urlbar.setText("" if url == START_PAGE else url.toString())
+        self._update_close_buttons()
 
     def _step_off_header(self, index):
         # only act if the selection is still stuck on that header
@@ -1378,6 +1601,59 @@ class Browser(QMainWindow):
         self.chrome.setVisible(not on)
         self.tabs.tabBar().setVisible(not on)
         self.showFullScreen() if on else self.showNormal()
+
+    def _make_profile(self, storage):
+        """A fully configured cookie jar; each tab group gets its own."""
+        profile = QWebEngineProfile(storage, self)
+        profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        profile.downloadRequested.connect(self._download)
+        s = profile.settings()
+        s.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+        s.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+        # the start page is a local file; without this it may not navigate
+        # to the web (search box / quick links -> ERR_NETWORK_ACCESS_DENIED)
+        s.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        # let calls ring and voice chats start without a prior click
+        s.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+        # auto-darken pages that have no dark theme of their own
+        s.setAttribute(QWebEngineSettings.WebAttribute.ForceDarkMode, True)
+        # some sites (Teams…) block calls on unknown browsers; the engine
+        # IS Chromium, so drop the QtWebEngine token from the identity
+        profile.setHttpUserAgent(
+            re.sub(r"\s?QtWebEngine/[\d.]+", "", profile.httpUserAgent()))
+        script = QWebEngineScript()
+        script.setName("google-black")
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+        script.setRunsOnSubFrames(False)
+        script.setSourceCode(GOOGLE_BLACK_JS)
+        profile.scripts().insert(script)
+        return profile
+
+    def _profile_for(self, group, session="main"):
+        """Cookies are per virtual browser: every tab in it — grouped
+        or not — shares that browser's jar."""
+        return self._session_profile(session or "main")
+
+    def _session_profile(self, sid):
+        if sid == "main":
+            return self.profile
+        if sid not in self.session_profiles:
+            self.session_profiles[sid] = self._make_profile("browser-s-" + sid)
+        return self.session_profiles[sid]
+
+    def _sync_profile(self, view):
+        """Keep a tab in its virtual browser's cookie jar (no-op unless
+        it somehow ended up in the wrong one)."""
+        want = self._profile_for(self._group_of(view),
+                                 getattr(view, "session", "main"))
+        if view.page().profile() is want:
+            return
+        url = view.url()
+        target = url if url.toString() else QUrl(getattr(view, "_requested", ""))
+        view.attach_profile(want)
+        view.load(target if target.toString() else START_PAGE)
 
     def _download(self, request):
         request.setDownloadDirectory(str(DOWNLOAD_DIR))
