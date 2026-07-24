@@ -194,6 +194,12 @@ QToolButton#groupbtn {
     margin: 4px 0 6px 6px;
     border-radius: 0px;
 }
+QToolButton#newtabbtn {
+    padding: 0px;
+    margin: 0px;
+    border-radius: 0px;
+    font-size: 15px;
+}
 """
 
 
@@ -253,15 +259,19 @@ class GroupTabBar(QTabBar):
                           + 30 + 6)
             else:
                 members += 1
-        available = self.width() - pills - 10
+        available = self.width() - pills - 46  # room for the + button
         share = available // max(1, members) - 6  # per-tab margins
         return QSize(max(34, min(240, share)), size.height())
 
     def tabLayoutChange(self):
         super().tabLayoutChange()
-        update = getattr(self.browser, "_update_close_buttons", None)
-        if update is not None and getattr(self.browser, "tabs", None):
-            update()
+        if getattr(self.browser, "tabs", None):
+            update = getattr(self.browser, "_update_close_buttons", None)
+            if update is not None:
+                update()
+            place = getattr(self.browser, "_place_newtab", None)
+            if place is not None:
+                place()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -565,11 +575,9 @@ class Browser(QMainWindow):
         back = QToolButton(text="‹")
         fwd = QToolButton(text="›")
         reload_ = QToolButton(text="⟳")
-        newtab = QToolButton(text="+")
         back.clicked.connect(lambda: self.current().back())
         fwd.clicked.connect(lambda: self.current().forward())
         reload_.clicked.connect(lambda: self.current().reload())
-        newtab.clicked.connect(lambda: self.new_tab())
 
         bar = QHBoxLayout()
         bar.setContentsMargins(10, 8, 10, 2)
@@ -577,7 +585,6 @@ class Browser(QMainWindow):
         for w in (back, fwd, reload_):
             bar.addWidget(w)
         bar.addWidget(self.urlbar, 1)
-        bar.addWidget(newtab)
 
         self.tabs = TabWidget(self)
         self.tabs.setDocumentMode(True)
@@ -601,6 +608,13 @@ class Browser(QMainWindow):
         self._book.setToolTip("Tab groups")
         self._book.clicked.connect(self._group_menu)
         self.tabs.setCornerWidget(self._book, Qt.Corner.TopLeftCorner)
+        # the + rides along right after the last tab, like Chrome
+        self._newtab_btn = QToolButton(self.tabs.tabBar(), text="+",
+                                       objectName="newtabbtn")
+        self._newtab_btn.setToolTip("New tab")
+        self._newtab_btn.setFixedSize(28, 26)
+        self._newtab_btn.clicked.connect(lambda: self.new_tab())
+        self._newtab_btn.show()
         self.tabs.tabBar().installEventFilter(self)
 
         self.chrome = QWidget(objectName="chrome")
@@ -661,9 +675,24 @@ class Browser(QMainWindow):
                 self.sessions.insert(0, {"name": "Browser 1", "sid": "main"})
         self.active_session = self.sessions[0]["sid"]
         self._restore_groups()
+        self._restore_session_tabs()
         self.new_tab(url=initial_url, group=None,
                      session=self.active_session)
         self.switch_session(self.active_session)
+
+    def _restore_session_tabs(self):
+        valid = {e["sid"] for e in self.sessions}
+        for sid, items in (self.config.get("sessionTabs") or {}).items():
+            if sid not in valid:
+                continue
+            for item in items:
+                if isinstance(item, dict):
+                    u, t = item.get("u", ""), item.get("t") or None
+                else:
+                    u, t = item, None
+                if u:
+                    self.new_tab(url=u, group=None, session=sid,
+                                 switch=False, lazy=True, title=t)
 
     def _save_groups(self):
         data = []
@@ -673,10 +702,12 @@ class Browser(QMainWindow):
                 view = self.tabs.widget(i)
                 url = view.url()
                 if url == START_PAGE:
-                    urls.append("")
+                    urls.append({"u": "", "t": ""})
                 else:
-                    urls.append(url.toString()
-                                or getattr(view, "_requested", ""))
+                    urls.append({"u": url.toString()
+                                 or getattr(view, "_pending", "")
+                                 or getattr(view, "_requested", ""),
+                                 "t": self.tabs.tabText(i)})
             data.append({"name": g,
                          "color": self.group_colors.get(g, "#6c7086"),
                          "collapsed": bool(self.collapsed.get(g)),
@@ -684,6 +715,24 @@ class Browser(QMainWindow):
                          "session": self.group_sessions.get(g, "main"),
                          "urls": urls})
         self.config["tabGroups"] = data
+        # loose tabs are saved per virtual browser too (start pages
+        # excluded — every start spawns a fresh one anyway)
+        session_tabs = {}
+        for i in range(self.tabs.count()):
+            view = self.tabs.widget(i)
+            if self._is_header(view) or self._group_of(view) is not None:
+                continue
+            url = view.url()
+            if url == START_PAGE:
+                continue
+            u = (url.toString() or getattr(view, "_pending", "")
+                 or getattr(view, "_requested", ""))
+            if not u:
+                continue
+            sid = getattr(view, "session", "main")
+            session_tabs.setdefault(sid, []).append(
+                {"u": u, "t": self.tabs.tabText(i)})
+        self.config["sessionTabs"] = session_tabs
         self.config["sessions"] = self.sessions
         self.save_config()
 
@@ -700,8 +749,13 @@ class Browser(QMainWindow):
                 session = "main"
             self._register_group(name, entry.get("color", "#6c7086"),
                                  session=session)
-            for url in urls:
-                self.new_tab(url=url or None, group=name, switch=False)
+            for item in urls:
+                if isinstance(item, dict):
+                    u, t = item.get("u", ""), item.get("t") or None
+                else:
+                    u, t = item, None
+                self.new_tab(url=u or None, group=name, switch=False,
+                             lazy=bool(u), title=t)
             if entry.get("collapsed"):
                 self._toggle_collapse(name)
 
@@ -806,7 +860,7 @@ class Browser(QMainWindow):
         return self.tabs.currentWidget()
 
     def new_tab(self, url=None, switch=True, blank=False,
-                group=INHERIT_GROUP, session=None):
+                group=INHERIT_GROUP, session=None, lazy=False, title=None):
         if group is INHERIT_GROUP:
             group = self._group_of(self.current())
         if session is None:
@@ -834,9 +888,18 @@ class Browser(QMainWindow):
             if url is None:
                 view.load(START_PAGE)
                 self._focus_url()
+            elif lazy:
+                # the page loads only when the tab is first opened,
+                # so restored sessions cost no memory until used
+                view._pending = url
+                view._requested = url
             else:
                 view._requested = url  # fallback for saving before commit
                 view.load(QUrl(url))
+        if title:
+            self.tabs.setTabText(i, title)
+        elif lazy and url:
+            self.tabs.setTabText(i, QUrl(url).host() or "Tab")
         return view
 
     def _add_close_button(self, index, view):
@@ -955,6 +1018,11 @@ class Browser(QMainWindow):
             item = lay.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        # also sweep strays a drag left floating outside the layout
+        for child in self.sessrow.children():
+            if isinstance(child, QWidget):
+                child.hide()
+                child.deleteLater()
         for entry in self.sessions:
             active = entry["sid"] == self.active_session
             b = QToolButton(text=entry["name"])
@@ -967,6 +1035,8 @@ class Browser(QMainWindow):
             b.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             b.customContextMenuRequested.connect(
                 lambda _p, sid=entry["sid"], b=b: self._session_menu(b, sid))
+            b._session_sid = entry["sid"]
+            b.installEventFilter(self)
             lay.addWidget(b)
         plus = QToolButton(text="+")
         plus.setToolTip("New virtual browser (own cookies and tabs)")
@@ -1016,6 +1086,59 @@ class Browser(QMainWindow):
             name += " 2"
         self.sessions.append({"name": name, "sid": uuid.uuid4().hex[:8]})
         self.switch_session(self.sessions[-1]["sid"])
+
+    def _session_buttons_in_layout(self):
+        out = []
+        for k in range(self.sesslay.count()):
+            w = self.sesslay.itemAt(k).widget()
+            if w is not None and hasattr(w, "_session_sid"):
+                out.append(w)
+        return out
+
+    def _drag_session_move(self, local_x):
+        drag = self._sess_drag
+        btn = drag["btn"]
+        if not drag["moved"]:
+            if abs(local_x - drag["x"]) <= 12:
+                return
+            # lift the button out of the row; a spacer keeps its slot
+            drag["moved"] = True
+            drag["index"] = self._session_buttons_in_layout().index(btn)
+            spacer = QWidget(self.sessrow)
+            spacer.setFixedSize(btn.size())
+            drag["spacer"] = spacer
+            self.sesslay.removeWidget(btn)
+            self.sesslay.insertWidget(drag["index"], spacer)
+            spacer.show()
+        # the button follows the cursor (all math in strip coordinates)
+        x = int(local_x - drag["grip"])
+        x = max(0, min(x, self.sessrow.width() - btn.width()))
+        btn.move(x, btn.y())
+        btn.raise_()
+        # the gap travels as the cursor crosses neighbors
+        others = self._session_buttons_in_layout()
+        target = sum(1 for b in others
+                     if local_x > b.geometry().center().x())
+        if target != drag["index"]:
+            drag["index"] = target
+            self.sesslay.removeWidget(drag["spacer"])
+            self.sesslay.insertWidget(target, drag["spacer"])
+            self.sesslay.activate()
+
+    def _drag_session_drop(self, drag):
+        drag["btn"].hide()
+        drag["btn"].deleteLater()  # the rebuild recreates it in place
+        spacer = drag["spacer"]
+        if spacer is not None:
+            self.sesslay.removeWidget(spacer)
+            spacer.deleteLater()
+        sid = drag["btn"]._session_sid
+        entry = next((e for e in self.sessions if e["sid"] == sid), None)
+        if entry is not None:
+            rest = [e for e in self.sessions if e["sid"] != sid]
+            i = max(0, min(drag["index"], len(rest)))
+            self.sessions = rest[:i] + [entry] + rest[i:]
+        self._update_session_bar()
 
     def _session_menu(self, button, sid):
         menu = QMenu(self)
@@ -1468,6 +1591,21 @@ class Browser(QMainWindow):
             self.urlbar.setText("" if url == START_PAGE else url.toString())
             self.urlbar.setCursorPosition(0)
 
+    def _place_newtab(self):
+        btn = getattr(self, "_newtab_btn", None)
+        if btn is None:
+            return
+        bar = self.tabs.tabBar()
+        last = None
+        for i in range(self.tabs.count()):
+            if bar.isTabVisible(i):
+                last = i
+        x = 6 if last is None else bar.tabRect(last).right() + 6
+        x = min(x, bar.width() - btn.width() - 2)
+        y = max(0, (bar.height() - btn.height()) // 2)
+        btn.move(max(0, x), y)
+        btn.raise_()
+
     def _update_close_buttons(self):
         """Very small tabs show just the site icon: the close button
         survives only on the active tab, like Chrome."""
@@ -1523,6 +1661,29 @@ class Browser(QMainWindow):
             pass
 
     def eventFilter(self, obj, event):
+        # dragging a virtual-browser button: it lifts out of the row
+        # and floats with the cursor, a gap marks where it will land
+        if isinstance(obj, QToolButton) and hasattr(obj, "_session_sid"):
+            if (event.type() == QEvent.Type.MouseButtonPress
+                    and event.button() == Qt.MouseButton.LeftButton):
+                local = self.sessrow.mapFromGlobal(
+                    event.globalPosition().toPoint()).x()
+                self._sess_drag = {"btn": obj, "moved": False,
+                                   "x": local,
+                                   "grip": event.position().x(),
+                                   "spacer": None, "index": 0}
+            elif (event.type() == QEvent.Type.MouseMove
+                    and getattr(self, "_sess_drag", None)):
+                self._drag_session_move(self.sessrow.mapFromGlobal(
+                    event.globalPosition().toPoint()).x())
+            elif (event.type() == QEvent.Type.MouseButtonRelease
+                    and getattr(self, "_sess_drag", None)):
+                drag = self._sess_drag
+                self._sess_drag = None
+                if drag["moved"]:
+                    self._drag_session_drop(drag)
+                    return True  # a drag is not a click
+            return False
         # group headers act as fold/unfold buttons: swallow their clicks
         # before Qt selects them, so the page never flashes
         if (obj is self.tabs.tabBar()
@@ -1563,6 +1724,10 @@ class Browser(QMainWindow):
             # selection landed on a header some indirect way: step off it
             QTimer.singleShot(0, lambda: self._step_off_header(index))
             return
+        if w is not None and getattr(w, "_pending", None):
+            pending = w._pending
+            w._pending = None
+            w.load(QUrl(pending))
         if w is not None and hasattr(w, "url"):
             url = w.url()
             self.urlbar.setText("" if url == START_PAGE else url.toString())
